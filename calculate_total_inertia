@@ -467,7 +467,8 @@ def calculate_total_inertia(self):
                 pass
 
             raw_loops = list(polygonize(planarized_network))
-            self.mesh_cells = [poly for poly in raw_loops if poly.area >= 100.0]
+            # [수정] 미세 오차 루프만 제외하고, 셀/슬릿 개수 1:1 매칭을 위해 1.0 이상 필터링 완화
+            self.mesh_cells = [poly for poly in raw_loops if poly.area >= 1.0]
 
             self.shear_flow_centerlines = list(all_cl)
 
@@ -628,7 +629,7 @@ def calculate_total_inertia(self):
                 if len(c) < 2: continue
                 p1 = (round(c[0][0], 2), round(c[0][1], 2))
                 p2 = (round(c[-1][0], 2), round(c[-1][1], 2))
-                if p1 == p2: continue
+                if p1 == p2: continue  # 점으로 수축된 선분 제외
                 
                 thk = cl.get('thickness', 10.0)
                 raw_edges.append({'p1': p1, 'p2': p2, 'line': cl['line'], 'thk': thk})
@@ -754,41 +755,42 @@ def calculate_total_inertia(self):
 
                     macro_line = LineString(path_coords)
                     mid_pt = macro_line.interpolate(0.5, normalized=True)
-                    cell_count = sum(1 for poly in self.mesh_cells if poly.exterior.distance(mid_pt) < 2.0)
+                    cell_count = sum(1 for poly in self.mesh_cells if poly.exterior.distance(mid_pt) < 1.0)
 
-                    # [수정] Slit 선정 개선: Shared wall(공유 격벽) 배제, Outer edge(외곽선) 중 X=0 근처 우선
+                    # [수정] Slit 선정 개선 (공유 격벽 배제 및 외곽 센터라인 최우선 타겟화)
+                    # Cost가 가장 높은 엣지가 Kruskal에서 최종 거부되어 Slit이 됨
                     if cell_count >= 2:
-                        cost = 0.0  # Shared wall: 먼저 선택되어 Tree Edge가 됨
+                        cost = -10000.0  # Shared Wall: 무조건 Tree Edge로 편입 (물리적 경로 보존)
                     elif cell_count == 1:
-                        # Outer edge: 나중에 선택되어 Slit Edge가 되도록 높은 Cost 부여
-                        # centerline(X=0) 근처일수록 우선적으로 Slit이 되게 만듦
-                        cost = 1000.0 - abs(mid_pt.x) 
+                        # Outer Wall: 최상단(Y 큼)이면서 정중앙(X=0)일수록 가장 높은 Cost를 받아 Slit이 됨
+                        cost = mid_pt.y * 100.0 - abs(mid_pt.x) * 2.0
                     else:
-                        cost = -10.0
+                        cost = -20000.0  # 맹장 선분 등
 
                     sn = pt_to_nid[start_pt]
                     en = pt_to_nid.get(current_pt, sn)
 
+                    # Self-loop(sn == en)도 그대로 macro_edges에 등록 (이후 Kruskal이 무조건 Slit으로 처리함)
+                    edge_dict = {
+                        'id': current_eid, 'start_node': sn, 'end_node': en,
+                        'line': macro_line, 'length': macro_line.length,
+                        'thickness': thk, 'cell_count': cell_count, 'cost': cost
+                    }
+                    macro_edges.append(edge_dict)
+                    node_edges[sn].append(current_eid)
                     if sn != en:
-                        edge_dict = {
-                            'id': current_eid, 'start_node': sn, 'end_node': en,
-                            'line': macro_line, 'length': macro_line.length,
-                            'thickness': thk, 'cell_count': cell_count, 'cost': cost
-                        }
-                        macro_edges.append(edge_dict)
-                        node_edges[sn].append(current_eid)
                         node_edges[en].append(current_eid)
-                        current_eid += 1
+                    current_eid += 1
 
             self.graph_edges = macro_edges
 
             # =============================================================
-            # --- 단계 C & D: BFS Spanning Tree 및 정정 전단류(q0) 산출 ---
+            # --- 단계 C & D: S_local 직접 적분 및 Outward BFS 누적 ---
             # =============================================================
-            progress.setLabelText("Step 13: BFS Outward Spanning Tree 및 q0 산출 중...")
+            progress.setLabelText("Step 13: S_local 적분 및 Outward BFS Spanning Tree 연산 중...")
             QApplication.processEvents()
 
-            # 1. Kruskal 최소 비용 스패닝 트리 (1셀 1슬릿 확정)
+            # 1. Kruskal을 통한 Spanning Tree 구축 (물리적 Slit 선정)
             parent = {i: i for i in range(len(self.cell_points))}
             def find(i):
                 if parent[i] == i: return i
@@ -817,7 +819,7 @@ def calculate_total_inertia(self):
             for e in self.graph_edges:
                 e['is_slit'] = e['id'] in self.slit_edge_ids
 
-            # 2. [수정] Root Node 선정: Slit edge에 인접한 노드 중 재현 가능한 (Y 최소, X 최소) 규칙 적용
+            # 2. [수정] Root Node 선정: Slit edge에 인접한 노드 중 Centerline(X=0) 근처, 상단(Y 큼) 노드를 우선
             slit_adj_nodes = set()
             for eid in self.slit_edge_ids:
                 e = self.graph_edges[eid]
@@ -825,15 +827,16 @@ def calculate_total_inertia(self):
                 slit_adj_nodes.add(e['end_node'])
 
             if slit_adj_nodes:
-                self.root_node = sorted(list(slit_adj_nodes), key=lambda n: (self.graph_nodes[n]['coord'][1], self.graph_nodes[n]['coord'][0]))[0]
+                self.root_node = sorted(list(slit_adj_nodes), key=lambda n: (abs(self.graph_nodes[n]['coord'][0]), -self.graph_nodes[n]['coord'][1]))[0]
             else:
-                self.root_node = sorted(list(self.graph_nodes.keys()), key=lambda n: (self.graph_nodes[n]['coord'][1], self.graph_nodes[n]['coord'][0]))[0]
+                self.root_node = sorted(list(self.graph_nodes.keys()), key=lambda n: (abs(self.graph_nodes[n]['coord'][0]), -self.graph_nodes[n]['coord'][1]))[0]
 
-            # 3. [수정] S_local 직접 적분 (Trapezoidal Rule)
+            # 3. [수정] S_local 직접 적분 (Trapezoidal Rule) - 곡률 대응 샘플링 증가
             for edge in self.graph_edges:
                 L = edge['length']
                 t = edge['thickness']
-                n_samples = max(2, int(L / 50.0) + 1)
+                # 곡률/각도 변화 대응을 위해 기본 분할을 촘촘히 (L/20), 최소 5개 이상
+                n_samples = max(5, int(L / 20.0) + 1)
                 
                 s_vals = np.linspace(0, L, n_samples)
                 edge['sample_s'] = s_vals
@@ -855,9 +858,9 @@ def calculate_total_inertia(self):
                         S_loc[k] = curr
                 
                 edge['S_local_array'] = S_loc
-                edge['S_total'] = curr
+                edge['S_local'] = curr  # 전체 L 구간에 대한 단일 edge의 순수 누적 적분량
 
-            # 4. [수정] BFS Outward 전파 (Root -> Branches)
+            # 4. [수정] BFS Outward 전파 (Root -> Tree branches)
             tree_adj = defaultdict(list)
             for eid in tree_edge_ids:
                 e = self.graph_edges[eid]
@@ -867,7 +870,7 @@ def calculate_total_inertia(self):
             s_at_node = {nid: None for nid in self.graph_nodes}
             node_depth = {nid: float('inf') for nid in self.graph_nodes}
             
-            # Root Node S=0 초기화
+            # Root Node에서 물리적 S=0 초기화
             s_at_node[self.root_node] = 0.0
             node_depth[self.root_node] = 0
 
@@ -892,15 +895,15 @@ def calculate_total_inertia(self):
                         e['bfs_direction'] = 'forward'
                     else:
                         # Edge 방향과 반대: S = S_start + (S_total - reversed(S_local))
-                        e['S_accumulated'] = current_S + (e['S_total'] - e['S_local_array'][::-1])
+                        e['S_accumulated'] = current_S + (e['S_local'] - e['S_local_array'][::-1])
                         e['bfs_direction'] = 'reverse'
 
-                    # 다음 노드에 S_exit 전달
+                    # 다음 노드에 S_exit 전달 (Outward)
                     s_at_node[v] = e['S_accumulated'][-1]
                     node_depth[v] = node_depth[u] + 1
                     queue.append(v)
                     
-            # 5. [수정] Slit Edge 후처리 (더 작은 S 또는 Root에 가까운 쪽 기준 복원)
+            # 5. [수정] Slit Edge 후처리 복원 (Depth 및 크기 기반 안정화)
             for e in self.graph_edges:
                 if e.get('is_slit', False):
                     sn = e['start_node']
@@ -909,17 +912,18 @@ def calculate_total_inertia(self):
                     s_en = s_at_node.get(en)
                     
                     if s_sn is not None and s_en is not None:
+                        # 양쪽 노드 모두 흐름이 도달한 경우 Root에 더 가까운 얕은 Depth 노드를 기준으로 복원
                         if node_depth[sn] <= node_depth[en]:
                             e['S_accumulated'] = s_sn + e['S_local_array']
                             e['bfs_direction'] = 'forward'
                         else:
-                            e['S_accumulated'] = s_en + (e['S_total'] - e['S_local_array'][::-1])
+                            e['S_accumulated'] = s_en + (e['S_local'] - e['S_local_array'][::-1])
                             e['bfs_direction'] = 'reverse'
                     elif s_sn is not None:
                         e['S_accumulated'] = s_sn + e['S_local_array']
                         e['bfs_direction'] = 'forward'
                     elif s_en is not None:
-                        e['S_accumulated'] = s_en + (e['S_total'] - e['S_local_array'][::-1])
+                        e['S_accumulated'] = s_en + (e['S_local'] - e['S_local_array'][::-1])
                         e['bfs_direction'] = 'reverse'
                     else:
                         e['S_accumulated'] = None
@@ -939,7 +943,7 @@ def calculate_total_inertia(self):
                         q0 = np.zeros(len(edge['sample_s']))
 
                     edge['q0'] = q0
-                    # 기하학적 방향(start->end) 배열로 복원 저장
+                    # 기하학적 원본 방향(start->end) 배열 생성
                     if edge.get('bfs_direction') == 'reverse':
                         edge['q0_geom'] = q0[::-1]
                     else:
@@ -947,21 +951,39 @@ def calculate_total_inertia(self):
                         
                     max_q0_val = max(max_q0_val, np.max(np.abs(q0)))
                 else:
-                    # S 할당 누락 검증 방어 코드
+                    # 예외 발생 방어 코드
                     missing_s_edges.append(edge['id'])
                     edge['q0'] = np.zeros(len(edge['sample_s']))
                     edge['q0_geom'] = edge['q0']
-            
-            root_residual = s_at_node.get(self.root_node, 0.0)
 
-            # 경고(Warning) 로직
+            # S 연속성 확인 (Tree Edges)
             val_warnings = []
+            for e in self.graph_edges:
+                if e.get('S_accumulated') is None: continue
+                if e.get('is_slit', False): continue # 슬릿은 인위적 절단이므로 노드 연속성에서 제외
+                
+                sn = e['start_node']
+                en = e['end_node']
+                
+                if e['bfs_direction'] == 'forward':
+                    start_val = e['S_accumulated'][0]
+                    ref_val = s_at_node[sn]
+                else:
+                    start_val = e['S_accumulated'][0]
+                    ref_val = s_at_node[en]
+                
+                if abs(start_val - ref_val) > 1e-3:
+                    val_warnings.append(f"[WARN] S Discontinuity at Edge E{e['id']} start: {start_val:.2f} != Node {ref_val:.2f}")
+
             if missing_s_edges:
                 val_warnings.append(f"[WARN] S calculation missing for edges: {missing_s_edges}")
                 for missing_id in missing_s_edges:
                     print(f"[WARN] slit edge S not assigned: E{missing_id}")
+                    
             if max_q0_val > 10000:
-                val_warnings.append(f"[WARN] Excessive q0 value detected: {max_q0_val:.2f}. Check S accumulation.")
+                val_warnings.append(f"[WARN] Excessive q0 value detected: {max_q0_val:.2f} N/mm. Check S accumulation.")
+
+            root_residual = s_at_node.get(self.root_node, 0.0)
 
             # =============================================================
             # 출력창(결과) 리포트 업데이트
@@ -985,16 +1007,17 @@ def calculate_total_inertia(self):
             res += f"Strict Vertices  : {len(self.graph_nodes)} (Only true corners/junctions)\n"
             res += f"Macro Graph Edges: {len(self.graph_edges)} (Merged Paths)\n"
             res += f"Tree Edges       : {len([e for e in self.graph_edges if not e['is_slit']])}\n"
-            res += f"Slit Edges       : {len(self.slit_edge_ids)} (BFS Spanning Tree 적용)\n\n"
+            res += f"Slit Edges       : {len(self.slit_edge_ids)} (BFS Outward 적용)\n\n"
 
             res += f"--- Validation Info ---\n"
-            res += f"Root Node ID     : {self.root_node} (Slit 인접 우선)\n"
+            res += f"Root Node ID     : {self.root_node} (Slit 인접, Centerline 근처)\n"
             res += f"Root Initial S   : {root_residual:.4e} (Must be 0.0)\n"
             
             if val_warnings:
                 res += "\n--- WARNINGS ---\n"
                 for w in val_warnings:
                     res += f"{w}\n"
+                    print(w)
 
             self.base_report = res
             self.result_box.setText(self.base_report)
